@@ -12,7 +12,7 @@ dependencies = [
   "cmocean",
   "dask",
   "h5py",
-  "healpy<1.17",
+  "healpy",
   "jinja2",
   "matplotlib",
   "numpy",
