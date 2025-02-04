@@ -1,18 +1,25 @@
-import functools
-import json
-import warnings
+from __future__ import annotations
 
-import dask.array as da
+import arrow
+import copy
+import json
 import h5py
-import matplotlib.pyplot as plt
+import logging
+
 import numpy as np
-import pandas as pd
 import scipy as sp
+import time as ttime
+
+from dask import array as da
 from astropy.io import fits
 
-from maria import utils
+from ..coords import Coordinates
+from ..instrument import Detectors
+from ..plotting import tod_plot, twinkle_plot
+from ..io import humanize_time, DEFAULT_TIME_FORMAT
+from ..atmosphere import AtmosphericSpectrum
 
-from .coords import Coordinates
+logger = logging.getLogger("maria")
 
 
 class TOD:
@@ -20,219 +27,214 @@ class TOD:
     Time-ordered data. This has per-detector pointing and data.
     """
 
-    def copy(self):
-        """
-        Copy yourself.
-        """
-        return TOD(
-            coords=self.coords,
-            components=self.components,
-            units=self.units,
-            dets=self.dets,
-            abscal=self.abscal,
-            dtype=self.dtype,
-        )
-
     def __init__(
         self,
-        coords: Coordinates,
-        components: dict = {},
-        units: dict = {},
-        dets: pd.DataFrame = None,
-        abscal: float = 1.0,
-        dtype=np.float32,
+        data: dict,
+        weight: float = None,
+        coords: Coordinates = None,
+        units: str = "K_RJ",
+        dets: Detectors = None,
+        dtype: type = np.float32,
+        metadata: dict = {},
     ):
+
+        self.weight = weight
         self.coords = coords
         self.dets = dets
         self.header = fits.header.Header()
-        self.abscal = abscal
         self.units = units
         self.dtype = dtype
+        self.metadata = metadata
 
-        self.components = {}
+        self.data = {}
 
-        for field, data in components.items():
-            self.components[field] = (
-                data if isinstance(data, da.Array) else da.from_array(data)
-            )
-            self.components[field] = self.components[field].astype(dtype)
+        for field, field_data in data.items():
+
+            if field_data.ndim != 2:
+                raise ValueError("Only two-dimensional TODs are currently supported.")
+
+            self.data[field] = da.asarray(field_data)
 
         # sort them alphabetically
-        self.components = {k: self.components[k] for k in sorted(list(self.fields))}
+        self.data = {k: self.data[k] for k in sorted(list(self.fields))}
 
-    def __getattr__(self, attr):
-        if attr in self.fields:
-            return self.components[attr]
-        raise AttributeError(f"No attribute named '{attr}'.")
+        if self.weight is None:
+            self.weight = da.ones_like(self.signal)
 
-    def __repr__(self):
-        return f"TOD(shape={self.shape}, fields={self.fields})"
+    @property
+    def spectrum(self):
+        if not hasattr(self, "_spectrum"):
+            if "region" in self.metadata:
+                self._spectrum = AtmosphericSpectrum(self.metadata["region"])
+            else:
+                self._spectrum = None
+        return self._spectrum
+
+    @property
+    def boresight(self):
+        if not hasattr(self, "_boresight"):
+            self._boresight = self.coords.boresight()
+        return self._boresight
+
+    def calibration_kwargs(self, band=None):
+
+        kwargs = {
+            "elevation": np.degrees(
+                self.el[self.dets.band_name == band.name] if band else self.el
+            )
+        }
+
+        if self.metadata["atmosphere"]:
+            kwargs["spectrum"] = self.spectrum
+            kwargs["zenith_pwv"] = self.metadata["pwv"]
+            kwargs["base_temperature"] = self.metadata["base_temperature"]
+
+        else:
+            kwargs["spectrum"] = None
+
+        return kwargs
+
+    def to(self, units: str):
+        """
+        Convert to a different set of units.
+        """
+
+        cal_start_s = ttime.monotonic()
+
+        # make sure that all detectors have a band that the TOD knows about
+        for band_name in np.unique(self.dets.band_name):
+            if band_name not in self.dets.bands.name:
+                raise ValueError(
+                    f"No band defined for detector with band '{band_name}'."
+                )
+
+        content = self.content
+        for band in self.dets.bands:
+
+            band_mask = self.dets.band_name == band.name
+
+            if band_mask.sum() == 0:
+                continue
+
+            # this is to handle transmission
+
+            cal = band.cal(f"{self.units} -> {units}", **self.calibration_kwargs(band))
+
+            for field in self.fields:
+
+                content["data"][field][band_mask] = cal(self.data[field][band_mask])
+
+        content["units"] = units
+
+        logger.debug(
+            f'Converted {self} to units "{units}" in {humanize_time(ttime.monotonic() - cal_start_s)}.'
+        )
+
+        return TOD(**content)
 
     @property
     def shape(self):
-        return self.data.shape
+        return self.signal.shape
 
     @property
-    def fields(self):
-        return sorted(list(self.components.keys()))
+    def fields(self) -> list:
+        return sorted(list(self.data.keys()))
 
-    @functools.cached_property
-    def data(self):
-        return sum(self.components.values())
+    @property
+    def signal(self) -> da.Array:
+        return sum([self.data[field] for field in self.fields])
 
-    @functools.cached_property
-    def boresight(self):
-        return self.coords.boresight
+    @property
+    def duration(self) -> float:
+        return np.ptp(self.time)
 
     @property
     def dt(self) -> float:
         return float(np.gradient(self.time, axis=-1).mean())
 
     @property
-    def fs(self) -> float:
+    def sample_rate(self) -> float:
         return float(1 / self.dt)
 
     @property
+    def fs(self) -> float:
+        return self.sample_rate
+
+    @property
     def nd(self) -> int:
-        return int(self.data.shape[0])
+        return int(self.signal.shape[0])
 
     @property
     def nt(self) -> int:
-        return int(self.data.shape[-1])
+        return int(self.signal.shape[-1])
+
+    @property
+    def start(self):
+        return arrow.get(self.time.max())
+
+    @property
+    def end(self):
+        return arrow.get(self.time.max())
 
     def subset(
-        self, det_mask=None, time_mask=None, band: str = None, fields: list = None
+        self,
+        det_mask: bool | int = None,
+        time_mask: bool | int = None,
+        band: str = None,
+        fields: list = None,
     ):
+
+        det_mask = det_mask or np.arange(self.nd)
+        time_mask = time_mask or np.arange(self.nt)
         fields = fields or self.fields
 
         if band is not None:
             det_mask = self.dets.band_name == band
             if not det_mask.sum() > 0:
                 raise ValueError(f"There are no detectors for band '{band}'.")
-            return self.subset(det_mask=det_mask)
 
         if time_mask is not None:
             if len(time_mask) != self.nt:
                 raise ValueError("The detector mask must have shape (n_dets,).")
 
-            subset_coords = Coordinates(
-                time=self.coords.time[time_mask],
-                time_offset=self.coords.time_offset,
-                phi=self.coords.az[:, time_mask],
-                theta=self.coords.el[:, time_mask],
-                location=self.location,
-                frame="az_el",
-            )
-
-            return TOD(
-                components={
-                    field: data[det_mask]
-                    for field, data in self.components.items()
-                    if field in fields
-                },
-                coords=subset_coords,
-                dets=self.dets,
-                units=self.units,
-            )
-
         if det_mask is not None:
             if not (len(det_mask) == self.nd):
                 raise ValueError("The detector mask must have shape (n_dets,).")
 
-            subset_dets = self.dets.loc[det_mask] if self.dets is not None else None
-
-            subset_coords = Coordinates(
-                time=self.time,
-                time_offset=self.coords.time_offset,
-                phi=self.coords.az[det_mask],
-                theta=self.coords.el[det_mask],
-                location=self.location,
-                frame="az_el",
-            )
-
-            return TOD(
-                components={
-                    field: data[det_mask]
-                    for field, data in self.components.items()
-                    if field in fields
+        content = self.content
+        content.update(
+            {
+                "data": {
+                    field: self.data[field][det_mask][..., time_mask]
+                    for field in fields
                 },
-                coords=subset_coords,
-                dets=subset_dets,
-                units=self.units,
-            )
+                "weight": self.weight[det_mask][..., time_mask],
+                "coords": self.coords[det_mask][..., time_mask],
+                "dets": self.dets._subset(det_mask),
+            }
+        )
 
-    def process(self, **kwargs):
-        D = self.data.compute()
-        W = np.ones(D.shape)
-
-        if "window" in kwargs:
-            if "tukey" in kwargs["window"]:
-                W *= sp.signal.windows.tukey(
-                    D.shape[-1], alpha=kwargs["window"]["tukey"].get("alpha", 0.1)
-                )
-                D = W * sp.signal.detrend(D, axis=-1)
-
-        if "filter" in kwargs:
-            if "window" not in kwargs:
-                warnings.warn("Filtering without windowing is not recommended.")
-
-            if "f_upper" in kwargs["filter"]:
-                D = utils.signal.lowpass(
-                    D,
-                    fc=kwargs["filter"]["f_upper"],
-                    fs=self.fs,
-                    order=kwargs["filter"].get("order", 1),
-                    method="bessel",
-                )
-
-            if "f_lower" in kwargs["filter"]:
-                D = utils.signal.highpass(
-                    D,
-                    fc=kwargs["filter"]["f_lower"],
-                    fs=self.fs,
-                    order=kwargs["filter"].get("order", 1),
-                    method="bessel",
-                )
-
-        if "remove_modes" in kwargs:
-            n_modes_to_remove = kwargs["remove_modes"]["n"]
-
-            U, V = utils.signal.decompose(
-                D, downsample_rate=np.maximum(int(self.fs / 16), 1), mode="uv"
-            )
-            D = U[:, n_modes_to_remove:] @ V[n_modes_to_remove:]
-
-        if "despline" in kwargs:
-            B = utils.signal.get_bspline_basis(
-                self.time.compute(),
-                spacing=kwargs["despline"].get("knot_spacing", 10),
-                order=kwargs["despline"].get("spline_order", 3),
-            )
-
-            A = np.linalg.inv(B @ B.T) @ B @ D.T
-            D -= A.T @ B
-
-        return W, D
+        return TOD(**content)
 
     @property
     def time(self):
-        return self.coords.time
+        return self.coords.t
 
     @property
-    def location(self):
-        return self.coords.location
+    def earth_location(self):
+        return self.coords.earth_location
 
     @property
     def lat(self):
-        return np.round(self.location.lat.deg, 6)
+        return np.round(self.earth_location.lat.deg, 6)
 
     @property
     def lon(self):
-        return np.round(self.location.lon.deg, 6)
+        return np.round(self.earth_location.lon.deg, 6)
 
     @property
     def alt(self):
-        return np.round(self.location.height.value, 6)
+        return np.round(self.earth_location.height.value, 6)
 
     @property
     def az(self):
@@ -271,16 +273,16 @@ class TOD:
             for s, e in self.splits(target_split_time=None):
                 split_time = self.time[e] - self.time[s]  # total time in the split
                 n_splits = int(
-                    np.ceil(split_time / target_split_time)
+                    np.ceil(split_time / target_split_time),
                 )  # number of new splits
                 n_split_samples = int(
-                    target_split_time * fs
+                    target_split_time * fs,
                 )  # number of samples per new split
                 for split_start in np.linspace(s, e - n_split_samples, n_splits).astype(
-                    int
+                    int,
                 ):
                     splits_list.append(
-                        (split_start, np.minimum(split_start + n_split_samples, e))
+                        (split_start, np.minimum(split_start + n_split_samples, e)),
                     )
             return splits_list
 
@@ -292,18 +294,22 @@ class TOD:
         if format.lower() == "mustang-2":
             header = fits.header.Header()
 
-            header["AZIM"] = (self.coords.center_az, "radians")
-            header["ELEV"] = (self.coords.center_el, "radians")
+            header["AZIM"] = (self.coords.center("az_el")[0].compute(), "radians")
+            header["ELEV"] = (self.coords.center("az_el")[1].compute(), "radians")
             header["BMAJ"] = (8.0, "arcsec")
             header["BMIN"] = (8.0, "arcsec")
             header["BPA"] = (0.0, "degrees")
+            header["NDETS"] = self.dets.n
 
             header["SITELAT"] = (self.lat, "Site Latitude")
             header["SITELONG"] = (self.lon, "Site Longitude")
             header["SITEELEV"] = (self.alt, "Site elevation (meters)")
 
             col01 = fits.Column(
-                name="DX   ", format="E", array=self.coords.ra.flatten(), unit="radians"
+                name="DX   ",
+                format="E",
+                array=self.coords.ra.flatten(),
+                unit="radians",
             )
             col02 = fits.Column(
                 name="DY   ",
@@ -311,11 +317,13 @@ class TOD:
                 array=self.coords.dec.flatten(),
                 unit="radians",
             )
+
+            tod_rj = self.to(units="K_RJ")
             col03 = fits.Column(
                 name="FNU  ",
                 format="E",
-                array=self.data.flatten(),
-                unit=self.units["data"],
+                array=tod_rj.signal.compute().flatten(),
+                unit=tod_rj.units,
             )
             col04 = fits.Column(name="UFNU ", format="E")
             col05 = fits.Column(
@@ -337,7 +345,9 @@ class TOD:
                 ).flatten(),
             )
             col09 = fits.Column(
-                name="SCAN ", format="I", array=np.zeros_like(self.coords.ra).flatten()
+                name="SCAN ",
+                format="I",
+                array=np.zeros_like(self.coords.ra).flatten(),
             )
             col10 = fits.Column(name="ELEV ", format="E")
 
@@ -350,71 +360,53 @@ class TOD:
 
     def to_hdf(self, fname):
         with h5py.File(fname, "w") as f:
-            f.createcomponentsset(fname)
+            f.createdataset(fname)
 
-    def plot(self, calibrate=True, detrend=True, mean=True, n_freq_bins: int = 256):
-        fig, axes = plt.subplots(
-            1,
-            2,
-            figsize=(10, 4),
-            dpi=256,
-            constrained_layout=True,
-            gridspec_kw={"width_ratios": [1, 1.6]},
-        )
-        ps_ax, tod_ax = axes
-
-        for field, data in self.components.items():
-            for band_name in np.unique(self.dets.band_name):
-                band_mask = self.dets.band_name == band_name
-                d = data[band_mask]
-
-                if detrend:
-                    d = sp.signal.detrend(d)
-                if calibrate:
-                    d *= self.dets.cal.loc[band_mask].mean()
-
-                f, ps = sp.signal.periodogram(
-                    sp.signal.detrend(d), fs=self.fs, window="tukey"
-                )
-
-                f_bins = np.geomspace(f[1], f[-1], n_freq_bins)
-                f_mids = np.sqrt(f_bins[1:] * f_bins[:-1])
-
-                binned_ps = sp.stats.binned_statistic(
-                    f, ps.mean(axis=0), bins=f_bins, statistic="mean"
-                )[0]
-
-                use = binned_ps > 0
-
-                ps_ax.plot(f_mids[use], binned_ps[use], label=f"{band_name} {field}")
-                tod_ax.plot(
-                    self.time - self.time.min(),
-                    d[0],
-                    lw=5e-1,
-                    label=f"{band_name} {field}",
-                )
-
-        ps_ax.set_xlabel("Time [s]")
-        ps_ax.set_ylabel("$T_{RJ}$ [K]" if calibrate else "[pW]")
-        ps_ax.legend()
-        ps_ax.loglog()
-        ps_ax.set_xlim(f_mids.min(), f_mids.max())
-
-        ps_ax.set_xlabel("Frequency [Hz]")
-
-        ylabel = (
-            r"Power spectrum [$K_{\rm RJ}^2~{\rm Hz}^{-1}$]"
-            if calibrate
-            else r"Power spectrum [pW$^2$Hz$^{-1}$]"
+    def plot(self, detrend=True, mean=True, n_freq_bins: int = 256):
+        tod_plot(
+            self,
+            detrend=detrend,
+            n_freq_bins=n_freq_bins,
         )
 
-        tod_ax.set_xlim(0, float(self.time.max()))
-        tod_ax.set_ylabel(ylabel)
+    def twinkle(self, filename=None, **kwargs):
+        twinkle_plot(
+            self,
+            filename=filename,
+            **kwargs,
+        )
 
+    def __getattr__(self, attr):
+        if attr in self.fields:
+            return self.data[attr]
+        raise AttributeError(f"No attribute named '{attr}'.")
 
-class KeyNotFoundError(Exception):
-    def __init__(self, invalid_keys):
-        super().__init__(f"The key '{invalid_keys}' is not in the database.")
+    def __repr__(self):
+        parts = []
+        parts.append(f"shape={self.shape}")
+        parts.append(f"fields={repr(self.fields)}")
+        parts.append(f"units={repr(self.units)}")
+        parts.append(f"start={self.start.format(DEFAULT_TIME_FORMAT)}")
+        parts.append(f"duration={self.duration:.01f}s")
+        parts.append(f"sample_rate={self.sample_rate:.01f}Hz")
+        parts.append(f"metadata={self.metadata}")
+        return f"TOD({', '.join(parts)})"
+
+    @property
+    def content(self):
+        res = {"data": {}}
+        for field in self.fields:
+            res["data"][field] = copy.deepcopy(self.data[field])
+        for key in ["coords", "units", "dets", "dtype", "metadata"]:
+            if hasattr(self, key):
+                res[key] = getattr(self, key)
+        return res
+
+    def copy(self):
+        """
+        Copy yourself.
+        """
+        return TOD(**self.content)
 
 
 def check_nested_keys(keys_found, data, keys):
@@ -425,7 +417,7 @@ def check_nested_keys(keys_found, data, keys):
 
 
 def check_json_file_for_key(keys_found, file_path, *keys_to_check):
-    with open(file_path, "r") as json_file:
+    with open(file_path) as json_file:
         data = json.load(json_file)
         return check_nested_keys(keys_found, data, keys_to_check)
 
@@ -437,4 +429,4 @@ def test_multiple_json_files(files_to_test, *keys_to_find):
         check_json_file_for_key(keys_found, file_path, *keys_to_find)
 
     if np.sum(keys_found) != len(keys_found):
-        raise KeyNotFoundError(np.array(keys_to_find)[~keys_found])
+        raise KeyError(np.array(keys_to_find)[~keys_found])

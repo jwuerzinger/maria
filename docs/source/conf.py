@@ -2,12 +2,12 @@
 #
 # For the full list of built-in configuration values, see the documentation:
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
-
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
+from __future__ import annotations
 
 project = "maria"
-copyright = "2023, Thomas W. Morris"
+copyright = "2024, Thomas W. Morris"
 author = "Thomas W. Morris"
 
 html_title = "maria"
@@ -47,4 +47,4 @@ pygments_dark_style = "monokai"
 autoapi_type = "python"
 autoapi_dirs = ["./../../maria"]
 
-nbsphinx_execute = "never"
+nbsphinx_execute = "always"

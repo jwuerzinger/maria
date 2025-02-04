@@ -1,24 +1,30 @@
+from __future__ import annotations
+
+import arrow
 import logging
 import os
+import gc
 
 import numpy as np
+import time as ttime
 
+from ..coords import Coordinates
 from ..instrument import Instrument, get_instrument
-from ..io import read_yaml
+from ..utils import read_yaml
+from ..io import humanize_time
 from ..plan import Plan, get_plan
 from ..site import Site, get_site
 from ..tod import TOD
-from ..tod.coords import Coordinates, dx_dy_to_phi_theta
 
 here, this_filename = os.path.split(__file__)
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("maria")
 
 
 class InvalidSimulationParameterError(Exception):
     def __init__(self, invalid_keys):
         super().__init__(
-            f"The parameters {invalid_keys} are not valid simulation parameters!"
+            f"The parameters {invalid_keys} are not valid simulation parameters!",
         )
 
 
@@ -41,7 +47,7 @@ def parse_sim_kwargs(kwargs, master_kwargs, strict=False):
     if len(invalid_kwargs) > 0:
         if strict:
             raise InvalidSimulationParameterError(
-                invalid_keys=list(invalid_kwargs.keys())
+                invalid_keys=list(invalid_kwargs.keys()),
             )
 
     return parsed_kwargs
@@ -54,34 +60,47 @@ class BaseSimulation:
 
     def __init__(
         self,
-        instrument: Instrument or str = "default",
-        plan: Plan or str = "stare",
-        site: Site or str = "default",
-        verbose=False,
+        instrument: Instrument | str,
+        plan: Plan | str,
+        site: Site | str,
+        progress_bars: bool = True,
+        dtype=np.float32,
         **kwargs,
     ):
+
+        start_init_s = ttime.monotonic()
+
         if hasattr(self, "boresight"):
             return
 
-        self.verbose = verbose
-
+        self.dtype = dtype
+        self.disable_progress_bars = (not progress_bars) or (
+            logging.getLevelName(logger.level) == "DEBUG"
+        )
         parsed_sim_kwargs = parse_sim_kwargs(kwargs, master_params)
 
         if isinstance(instrument, Instrument):
             self.instrument = instrument
         else:
             self.instrument = get_instrument(
-                instrument_name=instrument, **parsed_sim_kwargs["instrument"]
+                name=instrument,
+                **parsed_sim_kwargs["instrument"],
             )
 
-        logger.info("Constructed instrument.")
+        logger.debug(
+            f"Initialized instrument in {humanize_time(ttime.monotonic() - start_init_s)}."
+        )
+        instrument_init_s = ttime.monotonic()
 
         if isinstance(plan, Plan):
             self.plan = plan
         else:
-            self.plan = get_plan(scan_pattern=plan, **parsed_sim_kwargs["plan"])
+            self.plan = get_plan(plan_name=plan, **parsed_sim_kwargs["plan"])
 
-        logger.info("Constructed plan.")
+        logger.debug(
+            f"Initialized plan in {humanize_time(ttime.monotonic() - instrument_init_s)}."
+        )
+        plan_init_s = ttime.monotonic()
 
         if isinstance(site, Site):
             self.site = site
@@ -89,76 +108,91 @@ class BaseSimulation:
             self.site = get_site(site_name=site, **parsed_sim_kwargs["site"])
         else:
             raise ValueError(
-                "The passed site must be either a Site object or a string."
+                "The passed site must be either a Site object or a string.",
             )
 
-        logger.info("Constructed site.")
-
-        self.data = {}
-        self.calibration = np.ones((self.instrument.dets.n, self.plan.n_time))
+        logger.debug(
+            f"Initialized site in {humanize_time(ttime.monotonic() - plan_init_s)}."
+        )
+        site_init_s = ttime.monotonic()
 
         self.boresight = Coordinates(
-            time=self.plan.time - self.plan.time.min(),
+            t=self.plan.time,
             phi=self.plan.phi,
             theta=self.plan.theta,
-            location=self.site.earth_location,
+            earth_location=self.site.earth_location,
             frame=self.plan.frame,
-            time_offset=self.plan.time.min(),
         )
 
-        logger.info("Constructed boresight.")
+        logger.debug(
+            f"Initialized boresight in {humanize_time(ttime.monotonic() - site_init_s)}."
+        )
+        boresight_init_s = ttime.monotonic()
 
-        if self.plan.max_vel > np.radians(self.instrument.vel_limit):
+        if self.plan.max_vel_deg > self.instrument.vel_limit:
             raise ValueError(
                 (
-                    f"The maximum velocity of the boresight ({np.degrees(self.plan.max_vel):.01f} deg/s) exceeds "
+                    f"The maximum velocity of the boresight ({self.plan.max_vel_deg:.01f} deg/s) exceeds "
                     f"the maximum velocity of the instrument ({self.instrument.vel_limit:.01f} deg/s)."
                 ),
             )
 
-        if self.plan.max_acc > np.radians(self.instrument.acc_limit):
+        if self.plan.max_acc_deg > self.instrument.acc_limit:
             raise ValueError(
                 (
-                    f"The maximum acceleration of the boresight ({np.degrees(self.plan.max_acc):.01f} deg/s^2) exceeds "
+                    f"The maximum acceleration of the boresight ({self.plan.max_acc_deg:.01f} deg/s^2) exceeds "
                     f"the maximum acceleration of the instrument ({self.instrument.acc_limit:.01f} deg/s^2)."
                 ),
             )
 
-        det_az, det_el = dx_dy_to_phi_theta(
-            *self.instrument.offsets.T[..., None], self.boresight.az, self.boresight.el
-        )
-
-        self.coords = Coordinates(
-            time=self.boresight.time,
-            phi=det_az,
-            theta=det_el,
-            location=self.site.earth_location,
+        # this can be expensive sometimes
+        self.coords = self.boresight.broadcast(
+            self.instrument.dets.offsets,
             frame="az_el",
-            time_offset=self.boresight.time_offset,
         )
 
-        logger.info("Constructed offsets.")
+        logger.debug(
+            f"Initialized coordinates in {humanize_time(ttime.monotonic() - boresight_init_s)}."
+        )
+
+        logger.debug(
+            f"Initialized generic simulation in {humanize_time(ttime.monotonic() - start_init_s)}."
+        )
 
     def _run(self):
         raise NotImplementedError()
 
-    def run(self, dtype=np.float32):
-        self.data = {}
+    def run(self):
+        self.loading = {}
 
         # Simulate all the junk
         self._run()
 
+        metadata = {
+            "atmosphere": False,
+            "sim_time": arrow.now(),
+            "altitude": float(self.site.altitude),
+            "region": self.site.region,
+        }
+
+        if hasattr(self, "atmosphere"):
+            metadata["atmosphere"] = True
+            metadata["pwv"] = float(np.round(self.atmosphere.weather.pwv, 3))
+            metadata["base_temperature"] = float(
+                np.round(self.atmosphere.weather.temperature[0], 3)
+            )
+
         tod = TOD(
-            components={k: v.astype(dtype) for k, v in self.data.items()},
-            dets=self.instrument.dets.df,
+            data=self.loading,
+            dets=self.instrument.dets,
             coords=self.coords,
+            units="pW",
+            metadata=metadata,
         )
 
-        tod.dets.loc[:, "cal"] = (
-            1 / self.instrument.dets.dP_dTRJ
-        )  # takes the data to TRJ
-
-        # tod.metadata = pd.Series({"pwv": self.atmosphere.weather.pwv,
-        #                         "region": self.site.region})
+        gc.collect()
 
         return tod
+
+    def plot_counts(self, x_bins=100, y_bins=100):
+        self.plan.plot_counts(instrument=self.instrument, x_bins=x_bins, y_bins=y_bins)

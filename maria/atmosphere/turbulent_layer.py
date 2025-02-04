@@ -1,13 +1,15 @@
+from __future__ import annotations
+
 import dask.array as da
 import numpy as np
 import scipy as sp
 
 from .. import utils
+from ..coords import Coordinates, get_center_phi_theta
 from ..functions import approximate_normalized_matern
 from ..instrument import Instrument
-from ..instrument.beams import construct_beam_filter, separably_filter
-from ..tod.coords import Coordinates, get_center_phi_theta
-from .weather import Weather
+from ..instrument.beam import construct_beam_filter, separably_filter_2d
+from ..weather import Weather
 
 MIN_SAMPLES_PER_RIBBON = 2
 RIBBON_SAMPLE_DECAY = 2
@@ -41,7 +43,7 @@ class TurbulentLayer:
         self.res = res
         self.timestep = timestep
 
-        self.sim_time = self.boresight.time.compute()
+        self.sim_time = self.boresight.time
         self.sim_az = self.boresight.az.compute()
         self.sim_el = self.boresight.el.compute()
 
@@ -58,15 +60,19 @@ class TurbulentLayer:
         self.angular_resolution = self.res / self.depth
 
         if verbose:
-            print(f"{self.angular_resolution = }")
+            print(f"{self.angular_resolution=}")
 
         self.layer_altitude = self.weather.altitude + self.depth / np.sin(self.sim_el)
 
         layer_wind_north = sp.interpolate.interp1d(
-            self.weather.altitude_levels, self.weather.wind_north, axis=0
+            self.weather.altitude,
+            self.weather.wind_north,
+            axis=0,
         )(self.layer_altitude)
         layer_wind_east = sp.interpolate.interp1d(
-            self.weather.altitude_levels, self.weather.wind_east, axis=0
+            self.weather.altitude,
+            self.weather.wind_east,
+            axis=0,
         )(self.layer_altitude)
 
         angular_velocity_x = (
@@ -80,7 +86,7 @@ class TurbulentLayer:
         ) / self.depth
 
         if verbose:
-            print(f"{(layer_wind_east, layer_wind_north) = }")
+            print(f"{(layer_wind_east, layer_wind_north)=}")
 
         # compute the offset with respect to the center of the scan
         center_az, center_el = get_center_phi_theta(self.sim_az, self.sim_el)
@@ -95,13 +101,14 @@ class TurbulentLayer:
 
         # find the detector offsets which form a convex hull
         self.detector_offsets = np.radians(
-            np.c_[self.instrument.sky_x, self.instrument.sky_y]
+            np.c_[self.instrument.sky_x, self.instrument.sky_y],
         )
 
         # add a small circle of offsets to account for the beams
         unit_circle_complex = np.exp(1j * np.linspace(0, 2 * np.pi, 64 + 1)[:-1])
         unit_circle_offsets = np.c_[
-            np.real(unit_circle_complex), np.imag(unit_circle_complex)
+            np.real(unit_circle_complex),
+            np.imag(unit_circle_complex),
         ]
 
         # this is a convex hull for the instrument if it's staring
@@ -110,7 +117,7 @@ class TurbulentLayer:
                 self.detector_offsets[None, :, None]
                 + self.instrument.angular_fwhm(depth)[:, None, None]
                 * unit_circle_offsets[None]
-            ).reshape(-1, 2)
+            ).reshape(-1, 2),
         )
         stare_convex_hull_points = stare_convex_hull.points[
             stare_convex_hull.vertices
@@ -131,7 +138,7 @@ class TurbulentLayer:
             (
                 self.boresight_angular_position[chds_index, None]
                 + stare_convex_hull_points[None]
-            ).reshape(-1, 2)
+            ).reshape(-1, 2),
         )
         self.atmosphere_hull_points = atmosphere_hull.points.reshape(-1, 2)[
             atmosphere_hull.vertices
@@ -139,7 +146,7 @@ class TurbulentLayer:
 
         # R takes us from the real (dx, dy) to a more compact (cross_section, extrusion) frame
         self.optres = utils.linalg.optimize_area_minimizing_rotation_matrix(
-            self.atmosphere_hull_points
+            self.atmosphere_hull_points,
         )
 
         assert self.optres.success
@@ -165,18 +172,22 @@ class TurbulentLayer:
             self.angular_resolution,
         )
         self.extrusion_side = np.arange(
-            extrusion_min, extrusion_max, self.angular_resolution
+            extrusion_min,
+            extrusion_max,
+            self.angular_resolution,
         )
 
         self.n_cross_section = len(self.cross_section_side)
         self.n_extrusion = len(self.extrusion_side)
 
         CROSS_SECTION, EXTRUSION = np.meshgrid(
-            self.cross_section_side, self.extrusion_side
+            self.cross_section_side,
+            self.extrusion_side,
         )
 
         self.TRANS_POINTS = np.concatenate(
-            [CROSS_SECTION[..., None], EXTRUSION[..., None]], axis=-1
+            [CROSS_SECTION[..., None], EXTRUSION[..., None]],
+            axis=-1,
         )
 
         extrusion_indices = [
@@ -196,11 +207,11 @@ class TurbulentLayer:
                 self.n_cross_section,
             )
             cross_section_indices = np.unique(
-                np.linspace(0, self.n_cross_section - 1, n_ribbon_samples).astype(int)
+                np.linspace(0, self.n_cross_section - 1, n_ribbon_samples).astype(int),
             )
             cross_section_sample_index.extend(cross_section_indices)
             extrusion_sample_index.extend(
-                np.repeat(extrusion_index, len(cross_section_indices))
+                np.repeat(extrusion_index, len(cross_section_indices)),
             )
 
         self.extrusion_sample_index = np.array(extrusion_sample_index)
@@ -233,9 +244,9 @@ class TurbulentLayer:
         self.n_sample = len(sample_positions)
 
         if verbose:
-            print(f"{self.n_extrusion = }")
-            print(f"{self.n_live_edge = }")
-            print(f"{self.n_sample = }")
+            print(f"{self.n_extrusion=}")
+            print(f"{self.n_live_edge=}")
+            print(f"{self.n_sample=}")
 
         # sample upper {i,j}
         i, j = np.triu_indices(self.n_sample, k=1)
@@ -252,8 +263,8 @@ class TurbulentLayer:
         COV_LE_S = matern_callback(
             np.sqrt(
                 np.square(sample_positions[None] - live_edge_positions[:, None]).sum(
-                    axis=2
-                )
+                    axis=2,
+                ),
             )
             / self.angular_outer_scale,
             5 / 6,
@@ -265,7 +276,7 @@ class TurbulentLayer:
         COV_LE_LE = np.eye(self.n_live_edge) + JITTER_LEVEL
         COV_LE_LE[i, j] = matern_callback(
             np.sqrt(
-                np.square(live_edge_positions[j] - live_edge_positions[i]).sum(axis=1)
+                np.square(live_edge_positions[j] - live_edge_positions[i]).sum(axis=1),
             )
             / self.angular_outer_scale,
             5 / 6,
@@ -280,10 +291,11 @@ class TurbulentLayer:
         self.A = COV_LE_S @ inv_COV_S_S
         self.B = np.linalg.cholesky(COV_LE_LE - self.A @ COV_LE_S.T)
         self.shaped_values = np.zeros(
-            (self.n_extrusion, self.n_cross_section), dtype=np.float32
+            (self.n_extrusion, self.n_cross_section),
+            dtype=np.float32,
         )
 
-        self.shaped_values = da.from_array(self.shaped_values)
+        self.shaped_values = da.asarray(self.shaped_values)
 
         self.atmosphere_detector_points = (
             self.detector_offsets[:, None] + self.boresight_angular_position[None]
@@ -304,7 +316,8 @@ class TurbulentLayer:
         )
 
         self.shaped_values = extruded_values.reshape(
-            self.n_extrusion, self.n_cross_section
+            self.n_extrusion,
+            self.n_cross_section,
         )
 
     def sample(self):
@@ -322,10 +335,12 @@ class TurbulentLayer:
                 res=self.angular_resolution,
                 beam_profile=self.instrument.beam_profile,
             )
-            FILTERED_VALUES = separably_filter(self.shaped_values, F)
+            FILTERED_VALUES = separably_filter_2d(self.shaped_values, F)
+            FILTERED_VALUES = self.shaped_values
 
             detector_values[band_index] = sp.interpolate.RegularGridInterpolator(
-                (self.cross_section_side, self.extrusion_side), FILTERED_VALUES.T
+                (self.cross_section_side, self.extrusion_side),
+                FILTERED_VALUES.T,
             )(self.atmosphere_detector_points[band_index])
 
         return detector_values
